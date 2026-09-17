@@ -9,6 +9,10 @@ final class CLIServer {
     private let serverQueue = DispatchQueue(label: "infinite-scroll.cli.server")
     private var listenFD: Int32 = -1
     private var watchers: [Int32] = []
+    /// Write queue per client fd. Broadcasts hop onto a queue that is separate
+    /// from the connection's read loop, otherwise a watcher's queued writes
+    /// would never run while its queue sits blocked in `read`.
+    private var connectionWriteQueues: [Int32: DispatchQueue] = [:]
     private let watchersLock = NSLock()
     private var cancellables: Set<AnyCancellable> = []
     private var started = false
@@ -20,6 +24,8 @@ final class CLIServer {
     func start() {
         guard !started else { return }
         started = true
+        // A watcher that disconnects mid-write must not take the app down.
+        signal(SIGPIPE, SIG_IGN)
         serverQueue.async { [weak self] in self?.run() }
         // Watch store changes on main thread and broadcast snapshots
         DispatchQueue.main.async { [weak self] in self?.subscribeToStore() }
@@ -100,7 +106,14 @@ final class CLIServer {
                 break
             }
             _ = fcntl(clientFD, F_SETFD, FD_CLOEXEC)
+            var noSigPipe: Int32 = 1
+            _ = withUnsafePointer(to: &noSigPipe) {
+                setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, $0, socklen_t(MemoryLayout<Int32>.size))
+            }
             let connQueue = DispatchQueue(label: "infinite-scroll.cli.client.\(clientFD)")
+            watchersLock.lock()
+            connectionWriteQueues[clientFD] = DispatchQueue(label: "infinite-scroll.cli.write.\(clientFD)")
+            watchersLock.unlock()
             connQueue.async { [weak self] in
                 self?.handleClient(fd: clientFD)
             }
@@ -119,6 +132,11 @@ final class CLIServer {
             }
             if n <= 0 { break }
             buffer.append(tmp, count: n)
+            // A client that never sends a newline must not grow memory without
+            // bound; drop the connection once a single line is unreasonable.
+            if buffer.count > Self.maxRequestBytes {
+                break
+            }
             while let nl = buffer.firstIndex(of: 0x0A) {
                 let line = buffer.subdata(in: buffer.startIndex..<nl)
                 buffer.removeSubrange(buffer.startIndex...nl)
@@ -128,9 +146,12 @@ final class CLIServer {
         }
         watchersLock.lock()
         watchers.removeAll { $0 == fd }
+        connectionWriteQueues.removeValue(forKey: fd)
         watchersLock.unlock()
         close(fd)
     }
+
+    private static let maxRequestBytes = 4 * 1024 * 1024
 
     /// Returns true if the connection should stay open (watch mode).
     private func processRequest(line: Data, fd: Int32) -> Bool {
@@ -143,7 +164,9 @@ final class CLIServer {
             let rows = DispatchQueue.main.sync { self.store?.cliVisibleSnapshot() ?? [] }
             writeResponse(CLIResponse(ok: true, rows: rows), to: fd)
             watchersLock.lock()
-            watchers.append(fd)
+            if !watchers.contains(fd) {
+                watchers.append(fd)
+            }
             watchersLock.unlock()
             return true
         }
@@ -189,7 +212,9 @@ final class CLIServer {
         case .notes(let text):
             return CLIResponse(ok: true, text: text)
         case .terminal(let session, let scrollback):
-            let text = TmuxCapture.capture(session: session, scrollback: scrollback)
+            guard let text = TmuxCapture.capture(session: session, scrollback: scrollback) else {
+                return .failure("failed to capture session \(session)")
+            }
             return CLIResponse(ok: true, text: text)
         }
     }
@@ -223,12 +248,17 @@ final class CLIServer {
             // key table instead of the shell, so cancel it first. `-X cancel`
             // is a no-op when the pane is not in copy-mode.
             _ = TmuxManager.run(["send-keys", "-t", session, "-X", "cancel"])
-            if let keys = req.keys, !keys.isEmpty {
-                TmuxManager.sendKeys(session, keys: keys)
+            var failures: [String] = []
+            if let keys = req.keys, !keys.isEmpty,
+               !TmuxManager.sendKeys(session, keys: keys) {
+                failures.append("keys")
             }
-            if let text = req.text, !text.isEmpty {
-                // -l for literal text (no key parsing)
-                _ = TmuxManager.run(["send-keys", "-t", session, "-l", text])
+            if let text = req.text, !text.isEmpty,
+               !TmuxManager.run(["send-keys", "-t", session, "-l", text]) {
+                failures.append("text")
+            }
+            guard failures.isEmpty else {
+                return .failure("tmux send failed (\(failures.joined(separator: ", "))) for session \(session)")
             }
             return .okEmpty()
         }
@@ -258,10 +288,22 @@ final class CLIServer {
             event: EventInfo(kind: kind)
         )
         watchersLock.lock()
-        let fds = watchers
+        let targets = watchers.compactMap { fd -> (Int32, DispatchQueue)? in
+            guard let queue = connectionWriteQueues[fd] else { return nil }
+            return (fd, queue)
+        }
         watchersLock.unlock()
-        for fd in fds {
-            writeResponse(resp, to: fd)
+        for (fd, queue) in targets {
+            queue.async { [weak self] in
+                guard let self else { return }
+                // The connection may have closed (and its fd been reused)
+                // between the snapshot and this write.
+                self.watchersLock.lock()
+                let stillRegistered = self.watchers.contains(fd)
+                self.watchersLock.unlock()
+                guard stillRegistered else { return }
+                self.writeResponse(resp, to: fd)
+            }
         }
     }
 
@@ -368,10 +410,10 @@ private enum SendPlan {
 // MARK: - tmux capture-pane helper
 
 enum TmuxCapture {
-    static func capture(session: String, scrollback: Int?) -> String {
+    static func capture(session: String, scrollback: Int?) -> String? {
         guard let data = TmuxManager.capturePane(session: session, scrollback: scrollback) else {
-            return ""
+            return nil
         }
-        return String(data: data, encoding: .utf8) ?? ""
+        return String(data: data, encoding: .utf8)
     }
 }

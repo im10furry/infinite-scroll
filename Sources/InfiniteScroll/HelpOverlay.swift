@@ -27,7 +27,9 @@ struct HelpOverlay: View {
         GeometryReader { proxy in
             let cardWidth = min(420, max(0, proxy.size.width - Theme.panelSpacing * 2))
             let cardHeight = min(560, max(0, proxy.size.height - Theme.panelSpacing * 2))
-            let usesCompactRows = cardWidth < 360
+            // Keyed off the window width: the card is capped at 420, so
+            // deriving this from cardWidth made it unreachable.
+            let usesCompactRows = proxy.size.width < 400
 
             ZStack {
                 Color.black.opacity(0.55)

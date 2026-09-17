@@ -14,6 +14,7 @@ final class AgentWorkspaceStore: ObservableObject {
     private var statusTimer: Timer?
     private var monitoringStartedAt: Date?
     private var refreshInFlight = false
+    private var refreshStartedAt: Date?
     private var cancellables: Set<AnyCancellable> = []
     private var terminationObserver: Any?
 
@@ -21,6 +22,12 @@ final class AgentWorkspaceStore: ObservableObject {
     /// cannot infer semantic task progress. Refresh this heartbeat at a modest
     /// cadence so the UI and persisted state never look frozen.
     private static let observationHeartbeatInterval: TimeInterval = 15
+    private static let activeRefreshInterval: TimeInterval = 2
+    private static let idleRefreshInterval: TimeInterval = 6
+    private static let refreshTimeout: TimeInterval = 30
+    /// Stopped runs stay in the queue briefly for context and are then pruned
+    /// by the scan itself, so the view is not left with unreachable entries.
+    private static let stoppedRunRetention: TimeInterval = 10 * 60
 
     init() {
         let saved = AgentWorkspacePersistence.load()
@@ -231,13 +238,19 @@ final class AgentWorkspaceStore: ObservableObject {
         runID: UUID,
         taskID: UUID,
         command: String,
-        attempt: Int
+        attempt: Int,
+        textDelivered: Bool = false
     ) {
         let delay: TimeInterval = attempt == 0 ? 0.4 : 0.6
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
             _ = TmuxManager.run(["send-keys", "-t", session, "-X", "cancel"])
-            let sentText = TmuxManager.run(["send-keys", "-t", session, "-l", command])
-            let sentEnter = sentText && TmuxManager.run(["send-keys", "-t", session, "Enter"])
+            // Never type the command twice: when only Enter failed, the text is
+            // already sitting on the pane's input line.
+            var delivered = textDelivered
+            if !delivered {
+                delivered = TmuxManager.run(["send-keys", "-t", session, "-l", command])
+            }
+            let sentEnter = delivered && TmuxManager.run(["send-keys", "-t", session, "Enter"])
 
             DispatchQueue.main.async {
                 guard let self,
@@ -260,7 +273,8 @@ final class AgentWorkspaceStore: ObservableObject {
                         runID: runID,
                         taskID: taskID,
                         command: command,
-                        attempt: attempt + 1
+                        attempt: attempt + 1,
+                        textDelivered: delivered
                     )
                 } else {
                     self.markLaunchFailure(
@@ -279,22 +293,45 @@ final class AgentWorkspaceStore: ObservableObject {
         guard statusTimer == nil else { return }
         monitoringStartedAt = Date()
         refreshStatuses()
-        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
-            self?.refreshStatuses()
+        scheduleNextRefresh()
+    }
+
+    /// Poll faster while there is anything to watch and slower on an idle
+    /// workspace; each tick re-arms the timer with the current cadence.
+    private func scheduleNextRefresh() {
+        let interval = (runs.isEmpty && tasks.isEmpty)
+            ? Self.idleRefreshInterval
+            : Self.activeRefreshInterval
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.statusTimer = nil
+            self.refreshStatuses()
+            self.scheduleNextRefresh()
         }
         statusTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
 
     private func refreshStatuses() {
-        guard !refreshInFlight, let panelStore else { return }
+        guard let panelStore else { return }
+        if refreshInFlight {
+            // A hung `ps`/tmux call must not stop monitoring forever.
+            if let startedAt = refreshStartedAt,
+               Date().timeIntervalSince(startedAt) > Self.refreshTimeout {
+                refreshInFlight = false
+            } else {
+                return
+            }
+        }
         let terminalIDs = panelStore.panels.flatMap { panel in
             panel.cells.compactMap { $0.type == .terminal ? $0.id : nil }
         }
         refreshInFlight = true
+        refreshStartedAt = Date()
         AgentProcessInspector.refresh(cellIDs: terminalIDs) { [weak self] observations in
             guard let self else { return }
             self.refreshInFlight = false
+            self.refreshStartedAt = nil
             self.apply(observations: observations, terminalIDs: Set(terminalIDs))
         }
     }
@@ -377,6 +414,14 @@ final class AgentWorkspaceStore: ObservableObject {
             if let taskID = run.taskID {
                 markTaskBlockedIfActive(taskID, message: "Assigned terminal was closed")
             }
+        }
+
+        // Age out stopped runs here: the sidebar filter alone had no repaint
+        // trigger, so stale rows could linger until an unrelated update.
+        let retentionCutoff = now.addingTimeInterval(-Self.stoppedRunRetention)
+        for (cellID, run) in Array(runs)
+        where run.state == .stopped && run.lastActivityAt < retentionCutoff {
+            runs.removeValue(forKey: cellID)
         }
     }
 
@@ -479,7 +524,16 @@ private enum AgentWorkspacePersistence {
 
     static func load() -> AgentWorkspaceState? {
         guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode(AgentWorkspaceState.self, from: data)
+        do {
+            return try JSONDecoder().decode(AgentWorkspaceState.self, from: data)
+        } catch {
+            // Keep the unreadable file instead of silently overwriting it with
+            // an empty queue on the next save.
+            let backup = fileURL.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970))")
+            try? FileManager.default.moveItem(at: fileURL, to: backup)
+            NSLog("[AgentWorkspaceStore] failed to load, moved aside to \(backup.lastPathComponent): \(error)")
+            return nil
+        }
     }
 
     static func save(_ state: AgentWorkspaceState) {

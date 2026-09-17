@@ -20,6 +20,7 @@ class PanelStore: ObservableObject {
     @Published var fontName: String = PanelStore.defaultFontName
     @Published var rowHeight: CGFloat = PanelStore.defaultRowHeight
     @Published var commandScrollSpeed: CGFloat = PanelStore.defaultCommandScrollSpeed
+    @Published var scrollbackLimit: Int = TmuxManager.defaultHistoryLimit
     @Published var focusedCellID: UUID?
     @Published var showHelp: Bool = false
     @Published var showWorkspaceSearch: Bool = false
@@ -48,6 +49,9 @@ class PanelStore: ObservableObject {
             rowHeight = saved.rowHeight ?? PanelStore.defaultRowHeight
             commandScrollSpeed = Self.clampedCommandScrollSpeed(
                 saved.commandScrollSpeed ?? Self.defaultCommandScrollSpeed
+            )
+            scrollbackLimit = Self.clampedScrollbackLimit(
+                saved.scrollbackLimit ?? TmuxManager.defaultHistoryLimit
             )
             for (i, state) in saved.panels.enumerated() {
                 panels.append(PanelModel.from(state: state, index: i))
@@ -97,6 +101,11 @@ class PanelStore: ObservableObject {
             .store(in: &autosaveCancellables)
 
         $commandScrollSpeed
+            .debounce(for: .seconds(2), scheduler: RunLoop.main)
+            .sink { [weak self] _ in self?.save() }
+            .store(in: &autosaveCancellables)
+
+        $scrollbackLimit
             .debounce(for: .seconds(2), scheduler: RunLoop.main)
             .sink { [weak self] _ in self?.save() }
             .store(in: &autosaveCancellables)
@@ -182,9 +191,15 @@ class PanelStore: ObservableObject {
 
     private func handleCommandShortcut(_ event: NSEvent) -> NSEvent? {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if showWorkspaceSearch, event.keyCode == 53, flags.isEmpty {
-            closeWorkspaceSearch()
-            return nil
+        if event.keyCode == 53, flags.isEmpty {
+            if showWorkspaceSearch {
+                closeWorkspaceSearch()
+                return nil
+            }
+            if showHelp {
+                showHelp = false
+                return nil
+            }
         }
 
         guard let action = AppCommandShortcut.action(
@@ -224,6 +239,10 @@ class PanelStore: ObservableObject {
         case .openSettings:
             guard openSettings() else { return event }
         case .toggleHelp:
+            // The two overlays should never stack on top of each other.
+            if !showHelp {
+                showWorkspaceSearch = false
+            }
             showHelp.toggle()
         case .findWorkspace:
             toggleWorkspaceSearch()
@@ -292,6 +311,10 @@ class PanelStore: ObservableObject {
 
     static func clampedCommandScrollSpeed(_ speed: CGFloat) -> CGFloat {
         min(max(speed, minCommandScrollSpeed), maxCommandScrollSpeed)
+    }
+
+    static func clampedScrollbackLimit(_ limit: Int) -> Int {
+        min(max(limit, TmuxManager.minHistoryLimit), TmuxManager.maxHistoryLimit)
     }
 
     // MARK: - Row naming
@@ -412,11 +435,12 @@ class PanelStore: ObservableObject {
         guard focusedCell < panel.cells.count else { return }
 
         let current = panel.cells[focusedCell]
-        // Always duplicate as a terminal cell (notes is toggled separately)
+        // Always duplicate as a terminal cell (notes is toggled separately).
+        // Use the tracked cwd (kept fresh by OSC 7 / polling) — querying tmux
+        // here would spawn a subprocess on the main thread.
         let sourceCwd: String
         if current.type == .terminal {
-            let sessionName = TmuxManager.sessionName(for: current.id)
-            sourceCwd = TmuxManager.paneCwd(session: sessionName) ?? current.cwd
+            sourceCwd = current.cwd
         } else {
             // Cmd+D on notes: use cwd of the last terminal in this row
             sourceCwd = panel.cells.last(where: { $0.type == .terminal })?.cwd ?? NSHomeDirectory()
@@ -522,6 +546,22 @@ class PanelStore: ObservableObject {
         }
     }
 
+    /// CLI edits add or remove cells without the UI focus dance; re-clamp and
+    /// refocus when the focused cell no longer exists so `focusedCellID` never
+    /// dangles on a deleted cell.
+    func reconcileFocusAfterExternalMutation() {
+        let stillExists = focusedCellID.map { id in
+            panels.contains { $0.cells.contains { $0.id == id } }
+        } ?? false
+        guard !stillExists else { return }
+        if focusedRow >= panels.count {
+            focusedRow = max(panels.count - 1, 0)
+            focusedCell = 0
+        }
+        clampCell()
+        applyFocus()
+    }
+
     private func scheduleFocus() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.applyFocus()
@@ -573,7 +613,8 @@ class PanelStore: ObservableObject {
             fontSize: fontSize,
             fontName: fontName,
             rowHeight: rowHeight,
-            commandScrollSpeed: Self.clampedCommandScrollSpeed(commandScrollSpeed)
+            commandScrollSpeed: Self.clampedCommandScrollSpeed(commandScrollSpeed),
+            scrollbackLimit: Self.clampedScrollbackLimit(scrollbackLimit)
         )
         PersistenceManager.save(state)
     }

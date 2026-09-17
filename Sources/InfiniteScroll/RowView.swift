@@ -5,6 +5,7 @@ struct RowView: View {
     let fontSize: CGFloat
     let fontName: String
     let rowHeight: CGFloat
+    let scrollbackLimit: Int
     let focusedCellID: UUID?
     let agentRuns: [UUID: AgentRun]
     let isNewlyInserted: Bool
@@ -34,6 +35,7 @@ struct RowView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Rename row (⌘⇧R)")
+                .accessibilityLabel("Rename row")
                 .onHover { hovering in
                     if hovering { NSCursor.arrow.push() } else { NSCursor.pop() }
                 }
@@ -58,6 +60,8 @@ struct RowView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .help("Toggle notes")
+                .accessibilityLabel("Toggle notes")
                 .onHover { hovering in
                     if hovering { NSCursor.arrow.push() } else { NSCursor.pop() }
                 }
@@ -70,6 +74,8 @@ struct RowView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .help("Close row")
+                .accessibilityLabel("Close row")
                 .onHover { hovering in
                     if hovering {
                         NSCursor.arrow.push()
@@ -95,6 +101,7 @@ struct RowView: View {
                             cell: cell,
                             fontSize: fontSize,
                             fontName: fontName,
+                            scrollbackLimit: scrollbackLimit,
                             agentRun: agentRuns[cell.id]
                         )
                             .frame(width: cellWidth(total: geo.size.width))
@@ -131,11 +138,15 @@ struct RowView: View {
     }
 
     private var statusColor: Color {
-        if let run = panel.cells.lazy.compactMap({ agentRuns[$0.id] }).first {
+        // Show the most attention-worthy agent when a row hosts several, so a
+        // waiting/failed run is not hidden behind a later working one.
+        if let run = panel.cells
+            .compactMap({ agentRuns[$0.id] })
+            .min(by: { AgentVisuals.priority(for: $0.state) < AgentVisuals.priority(for: $1.state) }) {
             return AgentVisuals.color(for: run.state)
         }
         let anyRunning = panel.cells.contains { $0.type == .terminal && $0.isRunning }
-        return anyRunning ? .green : .gray
+        return anyRunning ? Theme.statusRunning : Theme.statusInactive
     }
 }
 
@@ -145,6 +156,7 @@ struct CellView: View {
     @ObservedObject var cell: CellModel
     let fontSize: CGFloat
     let fontName: String
+    let scrollbackLimit: Int
     let agentRun: AgentRun?
 
     var body: some View {
@@ -156,6 +168,7 @@ struct CellView: View {
                     initialDirectory: cell.cwd,
                     fontSize: fontSize,
                     fontName: fontName,
+                    scrollbackLimit: scrollbackLimit,
                     onExit: { _ in cell.isRunning = false },
                     onCwdChange: { cwd in cell.cwd = cwd }
                 )

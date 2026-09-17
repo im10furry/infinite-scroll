@@ -16,6 +16,16 @@ enum Theme {
     static let notesBackground = Color(red: 0.12, green: 0.12, blue: 0.14)
     static let notesText = Color(red: 0.85, green: 0.85, blue: 0.88)
 
+    // Status colors shared by row headers and the agent queue
+    static let statusRunning = Color(red: 0.3, green: 0.7, blue: 0.4)
+    static let statusInactive = Color(red: 0.5, green: 0.5, blue: 0.53)
+    static let statusWarning = Color.orange
+    static let statusSuccess = Color.green
+
+    // Badge chrome drawn over terminal content
+    static let badgeText = Color.white.opacity(0.92)
+    static let badgeBackground = Color.black.opacity(0.74)
+
     static let panelHeight: CGFloat = 750
     static let headerHeight: CGFloat = 32
     static let panelCornerRadius: CGFloat = 8

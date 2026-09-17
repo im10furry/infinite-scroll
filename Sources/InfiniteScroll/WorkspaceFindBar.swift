@@ -66,12 +66,15 @@ struct WorkspaceFindBar: View {
 
     @ViewBuilder
     private var searchContent: some View {
+        // Evaluate the scan once per render; reading `results` from both the
+        // empty check and the list doubled the cost on every keystroke.
+        let matches = results
         if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             Text("Search row names, folders, and notes. Press Return to jump to the first result.")
                 .font(.system(size: 12))
                 .foregroundColor(Theme.textSecondary)
                 .padding(14)
-        } else if results.isEmpty {
+        } else if matches.isEmpty {
             Text("No workspace matches")
                 .font(.system(size: 12))
                 .foregroundColor(Theme.textSecondary)
@@ -79,7 +82,7 @@ struct WorkspaceFindBar: View {
         } else {
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(results) { result in
+                    ForEach(matches) { result in
                         Button {
                             store.jumpToSearchResult(result)
                         } label: {

@@ -3,6 +3,7 @@ import SwiftUI
 
 struct AgentQueueView: View {
     @ObservedObject var agentStore: AgentWorkspaceStore
+    @State private var showSettings = false
     private static let recentStoppedRunInterval: TimeInterval = 10 * 60
 
     /// Keep attention-requiring and active agents first. Stopped agents are
@@ -12,8 +13,8 @@ struct AgentQueueView: View {
         return agentStore.runs.values
             .filter { $0.state != .stopped || $0.lastActivityAt >= recentCutoff }
             .sorted { lhs, rhs in
-                let lhsPriority = Self.priority(for: lhs.state)
-                let rhsPriority = Self.priority(for: rhs.state)
+                let lhsPriority = AgentVisuals.priority(for: lhs.state)
+                let rhsPriority = AgentVisuals.priority(for: rhs.state)
                 if lhsPriority != rhsPriority {
                     return lhsPriority < rhsPriority
                 }
@@ -26,15 +27,20 @@ struct AgentQueueView: View {
             header
             Divider()
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
-                    if !visibleRuns.isEmpty {
-                        runSection
-                    } else {
-                        emptyState
+            if showSettings {
+                SettingsView(embedded: true)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        if !visibleRuns.isEmpty {
+                            runSection
+                        } else {
+                            emptyState
+                        }
                     }
+                    .padding(12)
                 }
-                .padding(12)
             }
         }
         .background(Theme.panelBackground)
@@ -42,15 +48,15 @@ struct AgentQueueView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Image(systemName: "point.3.connected.trianglepath.dotted")
+            Image(systemName: showSettings ? "gearshape" : "point.3.connected.trianglepath.dotted")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(Theme.accent)
 
-            Text("Agent Queue")
+            Text(showSettings ? "Settings" : "Agent Queue")
                 .font(.system(size: 13, weight: .semibold, design: .monospaced))
                 .foregroundColor(Theme.text)
 
-            if activeRunCount > 0 {
+            if !showSettings && activeRunCount > 0 {
                 Text("\(activeRunCount)")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundColor(Theme.accent)
@@ -60,6 +66,16 @@ struct AgentQueueView: View {
             }
 
             Spacer()
+
+            Button {
+                showSettings.toggle()
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(showSettings ? Theme.accent : Theme.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .help(showSettings ? "Back to Agent Queue" : "Settings")
 
             Button {
                 agentStore.isQueueVisible = false
@@ -109,18 +125,6 @@ struct AgentQueueView: View {
         agentStore.runs.values.filter(\.state.occupiesTerminal).count
     }
 
-    private static func priority(for state: AgentRunState) -> Int {
-        switch state {
-        case .waitingForUser, .waitingForApproval, .failed:
-            0
-        case .starting, .working:
-            1
-        case .idle, .unknown:
-            2
-        case .stopped:
-            3
-        }
-    }
 }
 
 /// An agent run is a navigational row: its left side answers “where?” and
@@ -295,12 +299,12 @@ struct AgentStatusBadge: View {
             }
         }
         .font(.system(size: compact ? 10 : 9, weight: .semibold, design: .monospaced))
-        .foregroundColor(compact ? Theme.text : .white.opacity(0.92))
+        .foregroundColor(compact ? Theme.text : Theme.badgeText)
         .padding(.horizontal, compact ? 0 : 7)
         .padding(.vertical, compact ? 0 : 4)
         .background {
             if !compact {
-                Color.black.opacity(0.74)
+                Theme.badgeBackground
                     .clipShape(Capsule())
             }
         }
@@ -309,13 +313,27 @@ struct AgentStatusBadge: View {
 }
 
 enum AgentVisuals {
+    /// Attention-requiring states sort first and win the row status color.
+    static func priority(for state: AgentRunState) -> Int {
+        switch state {
+        case .waitingForUser, .waitingForApproval, .failed:
+            return 0
+        case .starting, .working:
+            return 1
+        case .idle, .unknown:
+            return 2
+        case .stopped:
+            return 3
+        }
+    }
+
     static func color(for state: AgentRunState) -> Color {
         switch state {
         case .starting: Theme.accent
-        case .working: Theme.addButton
-        case .waitingForUser, .waitingForApproval: .orange
+        case .working: Theme.statusRunning
+        case .waitingForUser, .waitingForApproval: Theme.statusWarning
         case .idle, .unknown: Theme.textSecondary
-        case .stopped: .gray
+        case .stopped: Theme.statusInactive
         case .failed: Theme.closeButton
         }
     }
@@ -324,11 +342,11 @@ enum AgentVisuals {
         switch state {
         case .pending: Theme.textSecondary
         case .starting: Theme.accent
-        case .running: Theme.addButton
-        case .waiting, .blocked: .orange
-        case .completed: .green
+        case .running: Theme.statusRunning
+        case .waiting, .blocked: Theme.statusWarning
+        case .completed: Theme.statusSuccess
         case .failed: Theme.closeButton
-        case .cancelled: .gray
+        case .cancelled: Theme.statusInactive
         }
     }
 }

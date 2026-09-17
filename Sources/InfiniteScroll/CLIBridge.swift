@@ -139,6 +139,7 @@ extension PanelStore {
         if panel.cells.isEmpty {
             removePanel(id: panel.id)
         }
+        reconcileFocusAfterExternalMutation()
     }
 
     func cliWriteNotes(rowIdx: Int, cellIdx: Int, text: String) -> Bool {
