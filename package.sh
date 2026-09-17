@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_NAME="Infinite Scroll"
 BUNDLE_NAME="InfiniteScroll"
-VERSION="1.0.19"
+VERSION="1.0.20"
 APP_BUNDLE="$APP_NAME.app"
 DMG_PATH="$BUNDLE_NAME.dmg"
 RW_DMG_PATH="$BUNDLE_NAME-rw.dmg"
