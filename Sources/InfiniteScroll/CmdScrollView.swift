@@ -33,19 +33,35 @@ class CmdNSScrollView: NSScrollView {
                     return nil
                 }
 
-                // Non-Cmd scroll: find terminal view under cursor and forward to it.
-                guard let docView = self.contentView.documentView else { return event }
-                let loc = docView.convert(event.locationInWindow, from: nil)
-                guard let hitView = docView.hitTest(loc) else { return event }
-                var current: NSView? = hitView
-                while let view = current {
-                    if let termView = view as? LocalProcessTerminalView {
-                        self.scrollTerminal(termView, with: event)
-                        return nil
-                    }
-                    current = view.superview
+                // Panels drawn above the canvas (Agent Queue, help, find bar)
+                // own their scrolling. The geometric lookup below cannot see
+                // that stacking, so let hit-tested overlays consume first.
+                if let hitView = window.contentView?.hitTest(event.locationInWindow),
+                   !Self.isView(hitView, inside: self) {
+                    return event
                 }
-                return event
+
+                // Non-Cmd scroll: route to the terminal under the cursor.
+                // SwiftUI overlays (focus borders, badges) can defeat AppKit
+                // hit testing here, so resolve the terminal geometrically from
+                // the registry instead of walking a hit-tested view chain.
+                guard let termView = TerminalViewRegistry.shared.terminalView(
+                    at: event.locationInWindow,
+                    in: window
+                ) else {
+                    return event
+                }
+                if termView.terminal.mouseMode != .off {
+                    // The pane application captures the mouse (opencode, Codex,
+                    // vim, …): hand the wheel to it so it scrolls its own
+                    // transcript, exactly like a native terminal. Hold Shift
+                    // to bypass and select text locally.
+                    termView.scrollWheel(with: event)
+                } else {
+                    self.scrollTerminal(termView, with: event)
+                }
+                TerminalViewRegistry.shared.refreshMouseRouting(for: termView)
+                return nil
             }
         }
     }
@@ -94,6 +110,15 @@ class CmdNSScrollView: NSScrollView {
         } else {
             termView.scrollDown(lines: lines)
         }
+    }
+
+    private static func isView(_ view: NSView, inside ancestor: NSView) -> Bool {
+        var current: NSView? = view
+        while let candidate = current {
+            if candidate === ancestor { return true }
+            current = candidate.superview
+        }
+        return false
     }
 
     private func scrollWheelLines(for delta: CGFloat) -> Int {

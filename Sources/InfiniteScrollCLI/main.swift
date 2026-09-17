@@ -43,7 +43,7 @@ case "ping":
 case "install":
     cmdInstall(rest)
 case "uninstall":
-    cmdUninstall()
+    cmdUninstall(rest)
 case "socket-path":
     print(CLISocket.path)
 default:
@@ -195,8 +195,7 @@ func cmdClose(_ args: [String]) {
 }
 
 func cmdWatch(_ args: [String]) {
-    let json = args.contains("--json") || true  // watch only makes sense as JSON
-    _ = json
+    // `watch` always streams JSON snapshots; --json is accepted for symmetry.
     let fd = connectOrExit()
     let req = CLIRequest(kind: "watch")
     writeLine(fd, req)
@@ -258,21 +257,22 @@ func cmdInstall(_ args: [String]) {
     }
 }
 
-func cmdUninstall() {
+func cmdUninstall(_ args: [String]) {
+    let target = args.first(where: { !$0.hasPrefix("--") }) ?? installTarget
     let fm = FileManager.default
-    if !fm.fileExists(atPath: installTarget) {
-        print("Not installed at \(installTarget)")
+    if !fm.fileExists(atPath: target) && (try? fm.destinationOfSymbolicLink(atPath: target)) == nil {
+        print("Not installed at \(target)")
         return
     }
     do {
-        try fm.removeItem(atPath: installTarget)
-        print("Removed \(installTarget)")
+        try fm.removeItem(atPath: target)
+        print("Removed \(target)")
         return
     } catch {
         // try with privileges
-        let script = "do shell script \"rm -f '\(installTarget)'\" with administrator privileges"
+        let script = "do shell script \"rm -f '\(target)'\" with administrator privileges"
         if runAppleScript(script) {
-            print("Removed \(installTarget)")
+            print("Removed \(target)")
         } else {
             fputs("uninstall failed: \(error)\n", stderr)
             exit(1)
@@ -301,9 +301,17 @@ func tryInstallDirect(source: String, target: String, force: Bool) -> Bool {
             try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
         } catch { return false }
     }
-    if fm.fileExists(atPath: target) || (try? fm.destinationOfSymbolicLink(atPath: target)) != nil {
-        if !force { try? fm.removeItem(atPath: target) }
-        if fm.fileExists(atPath: target) { try? fm.removeItem(atPath: target) }
+    if let existing = try? fm.destinationOfSymbolicLink(atPath: target) {
+        if existing == source { return true }
+        // Replace older symlink installs; they are ours to manage.
+        guard (try? fm.removeItem(atPath: target)) != nil else { return false }
+    } else if fm.fileExists(atPath: target) {
+        // Never delete a regular file unless --force says so explicitly.
+        guard force else {
+            fputs("refusing to replace \(target) without --force\n", stderr)
+            return false
+        }
+        guard (try? fm.removeItem(atPath: target)) != nil else { return false }
     }
     do {
         try fm.createSymbolicLink(atPath: target, withDestinationPath: source)
@@ -445,8 +453,10 @@ func printHelp() {
     USAGE
       infinite-scroll <command> [args]
 
-    Cells are referenced by "row.cell" (rows start at 1, cells at 1) or by UUID.
-    Row 0 is the orchestrator's own row and is not addressable from the CLI.
+    Cells are referenced by "row.cell" (row numbers as printed by `list`,
+    cells start at 1) or by UUID. Row 0 is the orchestrator's row and is not
+    addressable. Row numbers shift as rows are added or removed — prefer UUIDs
+    in scripts.
 
     COMMANDS
       list, ls [--json]              List all rows and cells

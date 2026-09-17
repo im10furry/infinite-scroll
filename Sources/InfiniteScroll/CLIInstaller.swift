@@ -26,13 +26,6 @@ enum CLIInstaller {
             }
         }
 
-        // 2) Dev: swift build output sits next to the main binary
-        if let exe = Bundle.main.executableURL {
-            let dev = exe.deletingLastPathComponent()
-                .appendingPathComponent("infinite-scroll").path
-            if fm.isExecutableFile(atPath: dev) { return dev }
-        }
-
         return nil
     }
 
@@ -109,11 +102,17 @@ enum CLIInstaller {
         let response = alert.runModal()
         defaults.set(true, forKey: firstRunKey)
         if response == .alertFirstButtonReturn {
-            if !install() {
-                let failAlert = NSAlert()
-                failAlert.messageText = "Install failed"
-                failAlert.informativeText = "Could not install the shell command. You can try again from Settings."
-                failAlert.runModal()
+            // The admin path can block for as long as the Authorization
+            // dialog is up; never do that on the main thread.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let installed = install()
+                guard !installed else { return }
+                DispatchQueue.main.async {
+                    let failAlert = NSAlert()
+                    failAlert.messageText = "Install failed"
+                    failAlert.informativeText = "Could not install the shell command. You can try again from Settings."
+                    failAlert.runModal()
+                }
             }
         }
     }
@@ -128,8 +127,13 @@ enum CLIInstaller {
                 return false
             }
         }
-        if somethingAtInstallTarget() {
+        // Replace an existing symlink (ours or an older install), but never
+        // delete a regular file the user placed there.
+        if (try? fm.destinationOfSymbolicLink(atPath: target)) != nil {
             guard (try? fm.removeItem(atPath: target)) != nil else { return false }
+        } else if fm.fileExists(atPath: target) {
+            NSLog("[CLIInstaller] refusing to replace non-symlink at \(target)")
+            return false
         }
         return (try? fm.createSymbolicLink(atPath: target, withDestinationPath: source)) != nil
     }

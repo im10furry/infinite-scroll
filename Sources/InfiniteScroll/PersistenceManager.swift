@@ -7,6 +7,7 @@ struct AppState: Codable {
     let fontName: String?
     let rowHeight: CGFloat?
     let commandScrollSpeed: CGFloat?
+    let scrollbackLimit: Int?
 }
 
 enum PersistenceManager {
@@ -29,7 +30,11 @@ enum PersistenceManager {
         do {
             return try JSONDecoder().decode(AppState.self, from: data)
         } catch {
-            print("PersistenceManager: failed to load — \(error)")
+            // Never let a decode failure look like "no workspace yet": that
+            // made the next save overwrite the user's layout with a fresh one.
+            let backup = fileURL.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970))")
+            try? FileManager.default.moveItem(at: fileURL, to: backup)
+            print("PersistenceManager: failed to load, moved aside to \(backup.lastPathComponent) — \(error)")
             return nil
         }
     }

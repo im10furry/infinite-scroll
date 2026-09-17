@@ -88,17 +88,21 @@ struct TerminalWrapper: NSViewRepresentable {
     let initialDirectory: String
     let fontSize: CGFloat
     let fontName: String
+    let scrollbackLimit: Int
     let onExit: (Int32) -> Void
     let onCwdChange: (String) -> Void
 
     func makeNSView(context: Context) -> LocalProcessTerminalView {
         let termView = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
-        // SwiftTerm defaults to 500 lines. Keep the same bounded history as
-        // the app-managed tmux pane so native scrolling can reach the complete
-        // retained terminal history without using tmux copy-mode.
-        termView.terminal.changeScrollback(TmuxManager.historyLimit)
-        // Disable SwiftTerm's mouse reporting so click+drag does text selection.
-        termView.allowMouseReporting = false
+        // Keep the same bounded history as the app-managed tmux pane so native
+        // scrolling can reach the complete retained terminal history without
+        // using tmux copy-mode.
+        termView.terminal.changeScrollback(scrollbackLimit)
+        context.coordinator.appliedScrollbackLimit = scrollbackLimit
+        // Report mouse events to the pane's application only when it asked for
+        // them (tmux turns reporting on per session; see refreshMouseRouting).
+        // The shell cells keep reporting off, so click+drag stays local.
+        termView.allowMouseReporting = true
 
         let bgColor = NSColor(red: 0.1, green: 0.1, blue: 0.12, alpha: 1.0)
         let fgColor = NSColor(red: 0.85, green: 0.85, blue: 0.88, alpha: 1.0)
@@ -116,17 +120,20 @@ struct TerminalWrapper: NSViewRepresentable {
         let envPairs = env.map { "\($0.key)=\($0.value)" }
 
         // Use tmux if available for session persistence. Prewarming normally
-        // resolves this off-main, but the first terminal can be created before
-        // that finishes; resolve once here rather than silently falling back to
-        // a non-persistent shell on first launch.
+        // resolves the tmux path off-main before the first terminal mounts; if
+        // it has not finished yet, resolve on a background queue rather than
+        // blocking SwiftUI layout on `findTmux()`.
         let sessionName = TmuxManager.sessionName(for: terminalID)
-        if let tmuxPath = TmuxManager.cachedTmuxPath() ?? TmuxManager.findTmux() {
-            // -A: attach if exists, create if not. -c is honored only on create.
-            // -D: detach other clients (from previous app run).
-            let args = ["new-session", "-A", "-D", "-s", sessionName, "-c", initialDirectory]
-            let coordinator = context.coordinator
+        let coordinator = context.coordinator
+
+        // -A: attach if exists, create if not. -c is honored only on create.
+        // -D: detach other clients (from previous app run).
+        let tmuxArgs = ["new-session", "-A", "-D", "-s", sessionName, "-c", initialDirectory]
+
+        let startTmux: (String) -> Void = { tmuxPath in
             coordinator.isTmux = true
             TerminalViewRegistry.shared.register(id: terminalID, view: termView, tmuxSession: sessionName)
+            TerminalViewRegistry.shared.refreshMouseRouting(for: termView, force: true)
 
             // Let SwiftUI complete the first layout pass before importing the
             // saved history. That keeps captured lines aligned with the final
@@ -134,34 +141,37 @@ struct TerminalWrapper: NSViewRepresentable {
             DispatchQueue.main.async { [weak coordinator] in
                 DispatchQueue.global(qos: .userInitiated).async {
                     TmuxManager.configureGlobals()
-                    _ = TmuxManager.configureExistingSession(sessionName)
-                    let history = TmuxManager.capturePaneHistory(session: sessionName)
+                    _ = TmuxManager.configureExistingSession(sessionName, historyLimit: scrollbackLimit)
+                    let history = TmuxManager.capturePaneHistory(session: sessionName, limit: scrollbackLimit)
+                        .map(Self.normalizedHistoryBytes)
                     DispatchQueue.main.async { [weak coordinator] in
+                        coordinator?.markCaptureResolved()
                         coordinator?.startTmuxClient(
                             executable: tmuxPath,
-                            args: args,
+                            args: tmuxArgs,
                             environment: envPairs,
                             session: sessionName,
+                            historyLimit: scrollbackLimit,
                             history: history
                         )
                     }
                 }
             }
 
-            // A stalled tmux server must not leave a new terminal blank. In
-            // the normal case the history capture wins this race; otherwise we
-            // start promptly and discard the late snapshot to keep input live.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak coordinator] in
-                coordinator?.startTmuxClient(
-                    executable: tmuxPath,
-                    args: args,
-                    environment: envPairs,
-                    session: sessionName,
-                    history: nil
-                )
-            }
-        } else {
-            // Fallback: plain zsh
+            // A stalled tmux server must not leave a new terminal blank. Probe
+            // while the history capture is still in flight so a slow capture
+            // wins the race whenever it can; only give up after several seconds
+            // and start without the restored history.
+            coordinator.scheduleStallFallback(
+                executable: tmuxPath,
+                args: tmuxArgs,
+                environment: envPairs,
+                session: sessionName,
+                historyLimit: scrollbackLimit
+            )
+        }
+
+        let startPlainShell: () -> Void = {
             termView.startProcess(
                 executable: "/bin/zsh",
                 args: ["-l"],
@@ -169,7 +179,29 @@ struct TerminalWrapper: NSViewRepresentable {
                 execName: "zsh",
                 currentDirectory: initialDirectory
             )
-            TerminalViewRegistry.shared.register(id: terminalID, view: termView)
+        }
+
+        // Register before the tmux decision resolves so a dismantle still
+        // unregisters the view instead of leaving a stale entry behind.
+        TerminalViewRegistry.shared.register(id: terminalID, view: termView)
+
+        if let tmuxPath = TmuxManager.cachedTmuxPath() {
+            startTmux(tmuxPath)
+        } else {
+            DispatchQueue.global(qos: .userInitiated).async { [weak termView] in
+                let tmuxPath = TmuxManager.findTmux()
+                DispatchQueue.main.async {
+                    guard let termView,
+                          TerminalViewRegistry.shared.view(for: terminalID) === termView else {
+                        return
+                    }
+                    if let tmuxPath {
+                        startTmux(tmuxPath)
+                    } else {
+                        startPlainShell()
+                    }
+                }
+            }
         }
 
         context.coordinator.startCwdPolling()
@@ -179,12 +211,43 @@ struct TerminalWrapper: NSViewRepresentable {
         return termView
     }
 
+    /// tmux capture-pane emits LF-only lines and a terminal LF does not reset
+    /// the column, so insert CR before LF. Runs on the capture queue because
+    /// the payload can reach megabytes after a large scrollback restore.
+    private static func normalizedHistoryBytes(_ history: Data) -> Data {
+        var bytes = Data()
+        bytes.reserveCapacity(history.count + history.count / 80)
+        var previous: UInt8?
+        for byte in history {
+            if byte == 0x0A, previous != 0x0D {
+                bytes.append(0x0D)
+            }
+            bytes.append(byte)
+            previous = byte
+        }
+        return bytes
+    }
+
     func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
         let font = NSFont(name: fontName, size: fontSize)
             ?? NSFont(name: "Menlo", size: fontSize)
             ?? NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
         if nsView.font.pointSize != fontSize || nsView.font.fontName != font.fontName {
             nsView.font = font
+        }
+
+        if context.coordinator.appliedScrollbackLimit != scrollbackLimit {
+            context.coordinator.appliedScrollbackLimit = scrollbackLimit
+            nsView.terminal.changeScrollback(scrollbackLimit)
+            if context.coordinator.isTmux {
+                let session = TmuxManager.sessionName(for: terminalID)
+                let limit = scrollbackLimit
+                DispatchQueue.global(qos: .utility).async {
+                    if !TmuxManager.setHistoryLimit(session: session, limit: limit) {
+                        print("[InfiniteScroll] failed to apply history-limit \(limit) to \(session)")
+                    }
+                }
+            }
         }
     }
 
@@ -197,9 +260,13 @@ struct TerminalWrapper: NSViewRepresentable {
         coordinator.stopCwdPolling()
         TerminalViewRegistry.shared.unregister(id: coordinator.terminalID)
         if coordinator.isTmux {
-            // Detach from tmux (don't kill the session — it persists). Ctrl+B, d.
-            let detachSeq: [UInt8] = [0x02, 0x64]
-            nsView.send(data: ArraySlice(detachSeq))
+            // Detach this client (the session itself persists). Sending the
+            // literal `C-b d` sequence would type into the pane for anyone
+            // using a custom tmux prefix.
+            let session = TmuxManager.sessionName(for: coordinator.terminalID)
+            DispatchQueue.global(qos: .utility).async {
+                TmuxManager.detachSession(session)
+            }
         }
     }
 
@@ -214,6 +281,16 @@ struct TerminalWrapper: NSViewRepresentable {
         var isTmux = false
         private var isActive = true
         private var tmuxLaunchStarted = false
+        /// Set once the history capture (success or failure) has been resolved,
+        /// so the stall fallback knows whether the normal launch path is about
+        /// to run.
+        private var captureResolved = false
+        private var stallFallbackAttempts = 0
+        private static let stallFallbackInterval: TimeInterval = 1.0
+        private static let maxStallFallbackAttempts = 4
+        /// Last value pushed to SwiftTerm/tmux so `updateNSView` only applies
+        /// real changes (it runs on every SwiftUI update).
+        var appliedScrollbackLimit = 0
 
         init(terminalID: UUID, initialDirectory: String, onExit: @escaping (Int32) -> Void, onCwdChange: @escaping (String) -> Void) {
             self.terminalID = terminalID
@@ -248,6 +325,48 @@ struct TerminalWrapper: NSViewRepresentable {
             isActive = false
         }
 
+        /// Mark the history capture as finished (with or without data) so the
+        /// stall fallback stops probing.
+        func markCaptureResolved() {
+            captureResolved = true
+        }
+
+        /// Start the tmux client without restored history only when the tmux
+        /// server stays unresponsive. Probing once per second lets a slow
+        /// capture still win; the previous single-shot fallback launched after
+        /// one second and silently discarded the captured history.
+        func scheduleStallFallback(
+            executable: String,
+            args: [String],
+            environment: [String],
+            session: String,
+            historyLimit: Int
+        ) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.stallFallbackInterval) { [weak self] in
+                guard let self, self.isActive, !self.tmuxLaunchStarted else { return }
+                guard !self.captureResolved else { return }
+                self.stallFallbackAttempts += 1
+                if self.stallFallbackAttempts >= Self.maxStallFallbackAttempts {
+                    self.startTmuxClient(
+                        executable: executable,
+                        args: args,
+                        environment: environment,
+                        session: session,
+                        historyLimit: historyLimit,
+                        history: nil
+                    )
+                    return
+                }
+                self.scheduleStallFallback(
+                    executable: executable,
+                    args: args,
+                    environment: environment,
+                    session: session,
+                    historyLimit: historyLimit
+                )
+            }
+        }
+
         /// Restore retained tmux history into SwiftTerm's normal buffer before
         /// the client attaches. The client then redraws only the current pane,
         /// leaving the restored history available to native trackpad scrolling.
@@ -256,6 +375,7 @@ struct TerminalWrapper: NSViewRepresentable {
             args: [String],
             environment: [String],
             session: String,
+            historyLimit: Int,
             history: Data?
         ) {
             guard isActive,
@@ -282,7 +402,11 @@ struct TerminalWrapper: NSViewRepresentable {
                     execName: "tmux"
                 )
                 DispatchQueue.global(qos: .userInitiated).async {
-                    TmuxManager.configureSession(session)
+                    TmuxManager.configureSession(session, historyLimit: historyLimit)
+                    DispatchQueue.main.async { [weak termView] in
+                        guard let termView else { return }
+                        TerminalViewRegistry.shared.refreshMouseRouting(for: termView, force: true)
+                    }
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self, weak termView] in
                     guard let self,
@@ -303,27 +427,21 @@ struct TerminalWrapper: NSViewRepresentable {
             hydrate(history: history, into: termView, then: launchProcess)
         }
 
-        /// tmux capture-pane uses LF-only output. A terminal LF does not reset
-        /// the column, so convert it to CRLF and feed bounded chunks on the
-        /// main run loop rather than blocking interface events on large panes.
+        /// Feeds a CRLF-normalized history capture in bounded chunks on the
+        /// main run loop. Normalization happens on the capture queue because a
+        /// 100k-line restore is megabytes of bytes.
         private func hydrate(history: Data, into termView: LocalProcessTerminalView, then completion: @escaping () -> Void) {
-            var bytes: [UInt8] = []
-            bytes.reserveCapacity(history.count + history.count / 80)
-            var previous: UInt8?
-            for byte in history {
-                if byte == 0x0A, previous != 0x0D {
-                    bytes.append(0x0D)
-                }
-                bytes.append(byte)
-                previous = byte
-            }
+            let bytes = [UInt8](history)
 
             guard !bytes.isEmpty else {
                 completion()
                 return
             }
 
-            let chunkSize = 16 * 1024
+            // Larger chunks keep the number of main-queue turns low for
+            // 100k-line restores while each chunk stays short enough to avoid
+            // visible hitches.
+            let chunkSize = 32 * 1024
             var offset = 0
             func feedNextChunk() {
                 guard isActive,
@@ -332,6 +450,10 @@ struct TerminalWrapper: NSViewRepresentable {
                     return
                 }
                 guard offset < bytes.count else {
+                    // The captured history can end mid-attribute or inside an
+                    // OSC 8 hyperlink. Reset both so the tmux client's first
+                    // frame is not tinted or rendered as a link.
+                    termView.feed(text: "\u{1b}[0m\u{1b}]8;;\u{1b}\\")
                     completion()
                     return
                 }

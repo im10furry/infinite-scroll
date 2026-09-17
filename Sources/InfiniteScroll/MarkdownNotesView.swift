@@ -73,12 +73,12 @@ struct MarkdownNotesView: NSViewRepresentable {
         textView.isAutomaticTextReplacementEnabled = false
 
         // Dark theme
-        textView.backgroundColor = NSColor(red: 0.12, green: 0.12, blue: 0.14, alpha: 1.0)
-        textView.textColor = NSColor(red: 0.85, green: 0.85, blue: 0.88, alpha: 1.0)
-        textView.insertionPointColor = NSColor(red: 0.85, green: 0.85, blue: 0.88, alpha: 1.0)
+        textView.backgroundColor = NSColor(Theme.notesBackground)
+        textView.textColor = NSColor(Theme.notesText)
+        textView.insertionPointColor = NSColor(Theme.notesText)
         textView.selectedTextAttributes = [
-            .backgroundColor: NSColor(red: 0.3, green: 0.4, blue: 0.6, alpha: 0.5),
-            .foregroundColor: NSColor(red: 0.85, green: 0.85, blue: 0.88, alpha: 1.0),
+            .backgroundColor: NSColor(Theme.focusBorder).withAlphaComponent(0.5),
+            .foregroundColor: NSColor(Theme.notesText),
         ]
 
         // Monospaced font

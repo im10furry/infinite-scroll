@@ -102,6 +102,7 @@ struct ContentView: View {
                             fontSize: store.fontSize,
                             fontName: store.fontName,
                             rowHeight: store.rowHeight,
+                            scrollbackLimit: store.scrollbackLimit,
                             focusedCellID: store.focusedCellID,
                             agentRuns: agentStore.runs,
                             isNewlyInserted: panel.id == store.newlyAddedPanelID,

@@ -14,6 +14,10 @@ struct InfiniteScrollApp: App {
         .windowStyle(.titleBar)
         .defaultSize(width: 1280, height: 800)
         .commands {
+            // Single-window app: a second window would run its own agent
+            // monitor and detach the first window's tmux clients.
+            CommandGroup(replacing: .newItem) { }
+
             // Cmd+W: close current cell
             CommandGroup(replacing: .saveItem) {
                 Button("Close Cell") {
